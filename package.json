@@ -1,0 +1,22 @@
+{
+  "name": "spartan-clean-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tek sunuculuk Spartan General/F9 log, boss ve müzik botu",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js"
+  },
+  "engines": { "node": "22.x" },
+  "dependencies": {
+    "@discord-player/extractor": "^7.1.0",
+    "@discordjs/voice": "^0.18.0",
+    "@snazzah/davey": "^0.1.11",
+    "discord-api-types": "0.38.52",
+    "discord-player": "^7.2.0",
+    "discord-player-youtubedlp": "^1.0.0",
+    "discord.js": "^14.26.4",
+    "pg": "8.13.1"
+  }
+}
