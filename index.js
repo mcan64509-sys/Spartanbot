@@ -60,14 +60,41 @@ player.events.on('playerError', (queue, error) => console.error('❌ Müzik play
 
 const commands = [
   new SlashCommandBuilder()
-    .setName('log').setDescription('Ses kanalındaki üyelerin setini kaydeder.')
+    .setName('log').setDescription('Ses kanalındaki herkese 1 set ekler ve log alır.')
     .addStringOption(o => o.setName('tur').setDescription('Boss türü').setRequired(true)
       .addChoices({ name: '🛡️ General', value: 'general' }, { name: '🕷️ F9', value: 'f9' }))
-    .addIntegerOption(o => o.setName('set').setDescription('Eklenecek set sayısı').setMinValue(1).setMaxValue(100).setRequired(false))
+    .addIntegerOption(o => o.setName('kivrik').setDescription('Bu logda alınan kıvrık').setMinValue(0).setMaxValue(100000).setRequired(false))
     .addStringOption(o => o.setName('not').setDescription('İsteğe bağlı açıklama').setMaxLength(300).setRequired(false)),
   new SlashCommandBuilder()
-    .setName('durum').setDescription('General ve F9 set toplamını gösterir.')
-    .addUserOption(o => o.setName('uye').setDescription('Bakılacak üye').setRequired(false)),
+    .setName('set-ekle').setDescription('Bir kullanıcıya manuel set ekler.')
+    .addStringOption(o => o.setName('tur').setDescription('Boss türü').setRequired(true)
+      .addChoices({ name: '🛡️ General', value: 'general' }, { name: '🕷️ F9', value: 'f9' }))
+    .addUserOption(o => o.setName('uye').setDescription('Set eklenecek kullanıcı').setRequired(true))
+    .addIntegerOption(o => o.setName('miktar').setDescription('Eklenecek set').setMinValue(1).setMaxValue(100000).setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('set-sil').setDescription('Bir kullanıcının setini azaltır.')
+    .addStringOption(o => o.setName('tur').setDescription('Boss türü').setRequired(true)
+      .addChoices({ name: '🛡️ General', value: 'general' }, { name: '🕷️ F9', value: 'f9' }))
+    .addUserOption(o => o.setName('uye').setDescription('Seti azaltılacak kullanıcı').setRequired(true))
+    .addIntegerOption(o => o.setName('miktar').setDescription('Silinecek set').setMinValue(1).setMaxValue(100000).setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('kivrik-ekle').setDescription('Güncel kıvrık toplamına ekleme yapar.')
+    .addStringOption(o => o.setName('tur').setDescription('Boss türü').setRequired(true)
+      .addChoices({ name: '🛡️ General', value: 'general' }, { name: '🕷️ F9', value: 'f9' }))
+    .addIntegerOption(o => o.setName('miktar').setDescription('Eklenecek kıvrık').setMinValue(1).setMaxValue(1000000).setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('kivrik-sil').setDescription('Güncel kıvrık toplamını azaltır.')
+    .addStringOption(o => o.setName('tur').setDescription('Boss türü').setRequired(true)
+      .addChoices({ name: '🛡️ General', value: 'general' }, { name: '🕷️ F9', value: 'f9' }))
+    .addIntegerOption(o => o.setName('miktar').setDescription('Silinecek kıvrık').setMinValue(1).setMaxValue(1000000).setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('sonuc').setDescription('Genel sıralamayı veya kullanıcı sonucunu gösterir.')
+    .addStringOption(o => o.setName('tur').setDescription('Boss türü').setRequired(true)
+      .addChoices({ name: '🛡️ General', value: 'general' }, { name: '🕷️ F9', value: 'f9' }))
+    .addUserOption(o => o.setName('uye').setDescription('Boş bırakılırsa genel sonuç gösterilir').setRequired(false)),
+  new SlashCommandBuilder()
+    .setName('log-sil').setDescription('Yanlış alınan logu geri alır.')
+    .addIntegerOption(o => o.setName('id').setDescription('Silinecek log numarası').setMinValue(1).setRequired(true)),
   new SlashCommandBuilder().setName('çal').setDescription('Ses kanalında müzik çalar.')
     .addStringOption(o => o.setName('şarkı').setDescription('Şarkı adı veya YouTube bağlantısı').setRequired(true)),
   new SlashCommandBuilder().setName('geç').setDescription('Çalan şarkıyı geçer.'),
@@ -98,6 +125,25 @@ async function initDatabase() {
       member_ids TEXT[] NOT NULL,
       moderator_id TEXT NOT NULL,
       note TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    ALTER TABLE spartan_logs ADD COLUMN IF NOT EXISTS curl_amount INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE spartan_logs ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+    ALTER TABLE spartan_logs ADD COLUMN IF NOT EXISTS deleted_by TEXT;
+    CREATE TABLE IF NOT EXISTS spartan_curls (
+      guild_id TEXT NOT NULL,
+      boss_type TEXT NOT NULL,
+      curl_count INTEGER NOT NULL DEFAULT 0 CHECK (curl_count >= 0),
+      PRIMARY KEY (guild_id, boss_type)
+    );
+    CREATE TABLE IF NOT EXISTS spartan_manual_actions (
+      id BIGSERIAL PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      boss_type TEXT NOT NULL,
+      action_type TEXT NOT NULL,
+      target_user_id TEXT,
+      amount INTEGER NOT NULL,
+      moderator_id TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS spartan_boss_notifications (
@@ -175,7 +221,7 @@ async function handleLog(interaction) {
   if (!isLogAuthorized(interaction)) return interaction.reply({ content: '❌ Bu komut yalnızca log yetkilisi tarafından kullanılabilir.', ephemeral: true });
   await interaction.deferReply({ ephemeral: true });
   const type = interaction.options.getString('tur');
-  const amount = interaction.options.getInteger('set') || 1;
+  const curlAmount = interaction.options.getInteger('kivrik') || 0;
   const note = interaction.options.getString('not') || null;
   const cfg = CONFIG.types[type];
   const voice = interaction.guild.channels.cache.get(cfg.voiceChannelId) || await interaction.guild.channels.fetch(cfg.voiceChannelId).catch(() => null);
@@ -188,23 +234,38 @@ async function handleLog(interaction) {
   const db = await pool.connect();
   try {
     await db.query('BEGIN');
+    const currentCounts = new Map();
     for (const member of members) {
-      await db.query(`
+      const updated = await db.query(`
         INSERT INTO spartan_user_sets(guild_id,user_id,boss_type,set_count)
-        VALUES($1,$2,$3,$4)
+        VALUES($1,$2,$3,1)
         ON CONFLICT(guild_id,user_id,boss_type)
-        DO UPDATE SET set_count=spartan_user_sets.set_count + EXCLUDED.set_count
-      `, [CONFIG.guildId, member.id, type, amount]);
+        DO UPDATE SET set_count=spartan_user_sets.set_count + 1
+        RETURNING set_count
+      `, [CONFIG.guildId, member.id, type]);
+      currentCounts.set(member.id, Number(updated.rows[0].set_count));
     }
     const saved = await db.query(`
-      INSERT INTO spartan_logs(guild_id,boss_type,set_amount,member_ids,moderator_id,note)
-      VALUES($1,$2,$3,$4,$5,$6) RETURNING id
-    `, [CONFIG.guildId, type, amount, members.map(m => m.id), interaction.user.id, note]);
+      INSERT INTO spartan_logs(guild_id,boss_type,set_amount,member_ids,moderator_id,note,curl_amount)
+      VALUES($1,$2,1,$3,$4,$5,$6) RETURNING id
+    `, [CONFIG.guildId, type, members.map(m => m.id), interaction.user.id, note, curlAmount]);
+    const curl = await db.query(`
+      INSERT INTO spartan_curls(guild_id,boss_type,curl_count) VALUES($1,$2,$3)
+      ON CONFLICT(guild_id,boss_type)
+      DO UPDATE SET curl_count=spartan_curls.curl_count + EXCLUDED.curl_count
+      RETURNING curl_count
+    `, [CONFIG.guildId, type, curlAmount]);
     await db.query('COMMIT');
-    const list = members.map((member, i) => `${i + 1}. ${member}`).join('\n');
-    const description = `**Eklenen set:** ${amount}\n**Üye sayısı:** ${members.length}\n**Yetkili:** ${interaction.user}\n**Log ID:** #${saved.rows[0].id}${note ? `\n**Not:** ${note}` : ''}\n\n${list}`;
-    await logChannel.send({ embeds: [embed(`${cfg.emoji} ${cfg.label} LOG`, description, cfg.color)] });
-    return interaction.editReply(`✅ ${members.length} üyeye ${amount} ${cfg.label} seti eklendi. Log ID: #${saved.rows[0].id}`);
+    const list = members
+      .sort((a, b) => currentCounts.get(b.id) - currentCounts.get(a.id))
+      .map((member, i) => `${i + 1}. ${member} — **Güncel set: ${currentCounts.get(member.id)}**`)
+      .join('\n');
+    const header = `**Her kullanıcıya eklenen:** +1 set\n**Katılımcı:** ${members.length}\n**Bu logda alınan kıvrık:** ${curlAmount}\n**Güncel toplam kıvrık:** ${Number(curl.rows[0].curl_count)}\n**Yetkili:** ${interaction.user}\n**Log ID:** #${saved.rows[0].id}${note ? `\n**Not:** ${note}` : ''}\n\n`;
+    const chunks = splitText(header + list, 3900);
+    for (let i = 0; i < chunks.length; i++) {
+      await logChannel.send({ embeds: [embed(`${cfg.emoji} ${cfg.label} LOG${chunks.length > 1 ? ` (${i + 1}/${chunks.length})` : ''}`, chunks[i], cfg.color)] });
+    }
+    return interaction.editReply(`✅ ${members.length} üyeye +1 ${cfg.label} seti eklendi. Güncel kıvrık: ${Number(curl.rows[0].curl_count)} • Log #${saved.rows[0].id}`);
   } catch (error) {
     await db.query('ROLLBACK').catch(() => {});
     console.error('❌ /log:', error);
@@ -214,12 +275,120 @@ async function handleLog(interaction) {
   }
 }
 
-async function handleStatus(interaction) {
-  const user = interaction.options.getUser('uye') || interaction.user;
-  const result = await pool.query('SELECT boss_type,set_count FROM spartan_user_sets WHERE guild_id=$1 AND user_id=$2', [CONFIG.guildId, user.id]);
-  const totals = { general: 0, f9: 0 };
-  for (const row of result.rows) totals[row.boss_type] = Number(row.set_count);
-  return interaction.reply({ embeds: [embed('📊 SPARTAN DURUM', `${user}\n\n🛡️ **General:** ${totals.general} set\n🕷️ **F9:** ${totals.f9} set`, 0x57f287)] });
+function splitText(text, maxLength) {
+  const chunks = [];
+  let current = '';
+  for (const line of text.split('\n')) {
+    if ((current + line + '\n').length > maxLength && current) { chunks.push(current.trim()); current = ''; }
+    current += line + '\n';
+  }
+  if (current.trim()) chunks.push(current.trim());
+  return chunks;
+}
+
+async function sendAudit(cfg, title, description) {
+  const channel = client.guilds.cache.get(CONFIG.guildId)?.channels.cache.get(cfg.logChannelId)
+    || await client.channels.fetch(cfg.logChannelId).catch(() => null);
+  if (channel?.isTextBased()) await channel.send({ embeds: [embed(title, description, cfg.color)] });
+}
+
+async function handleSetChange(interaction, direction) {
+  if (!isLogAuthorized(interaction)) return interaction.reply({ content: '❌ Bu komut yalnızca log yetkilisi tarafından kullanılabilir.', ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+  const type = interaction.options.getString('tur');
+  const user = interaction.options.getUser('uye');
+  const requested = interaction.options.getInteger('miktar');
+  const cfg = CONFIG.types[type];
+  const db = await pool.connect();
+  try {
+    await db.query('BEGIN');
+    const beforeResult = await db.query('SELECT set_count FROM spartan_user_sets WHERE guild_id=$1 AND user_id=$2 AND boss_type=$3 FOR UPDATE', [CONFIG.guildId, user.id, type]);
+    const before = Number(beforeResult.rows[0]?.set_count || 0);
+    const actual = direction > 0 ? requested : Math.min(requested, before);
+    const after = before + direction * actual;
+    await db.query(`INSERT INTO spartan_user_sets(guild_id,user_id,boss_type,set_count) VALUES($1,$2,$3,$4)
+      ON CONFLICT(guild_id,user_id,boss_type) DO UPDATE SET set_count=EXCLUDED.set_count`, [CONFIG.guildId, user.id, type, after]);
+    await db.query(`INSERT INTO spartan_manual_actions(guild_id,boss_type,action_type,target_user_id,amount,moderator_id) VALUES($1,$2,$3,$4,$5,$6)`,
+      [CONFIG.guildId, type, direction > 0 ? 'set_add' : 'set_remove', user.id, actual, interaction.user.id]);
+    await db.query('COMMIT');
+    const description = `**Kullanıcı:** ${user}\n**Değişiklik:** ${direction > 0 ? '+' : '-'}${actual} set\n**Önceki:** ${before}\n**Güncel:** ${after}\n**Yetkili:** ${interaction.user}`;
+    await sendAudit(cfg, `${direction > 0 ? '➕' : '➖'} ${cfg.label} MANUEL SET ${direction > 0 ? 'EKLENDİ' : 'SİLİNDİ'}`, description);
+    return interaction.editReply(`✅ ${user} • ${cfg.label} güncel set: ${after}`);
+  } catch (error) {
+    await db.query('ROLLBACK').catch(() => {}); console.error('❌ Set değişikliği:', error);
+    return interaction.editReply('❌ Set değiştirilemedi.');
+  } finally { db.release(); }
+}
+
+async function handleCurlChange(interaction, direction) {
+  if (!isLogAuthorized(interaction)) return interaction.reply({ content: '❌ Bu komut yalnızca log yetkilisi tarafından kullanılabilir.', ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+  const type = interaction.options.getString('tur');
+  const requested = interaction.options.getInteger('miktar');
+  const cfg = CONFIG.types[type];
+  const db = await pool.connect();
+  try {
+    await db.query('BEGIN');
+    await db.query('INSERT INTO spartan_curls(guild_id,boss_type,curl_count) VALUES($1,$2,0) ON CONFLICT DO NOTHING', [CONFIG.guildId, type]);
+    const beforeResult = await db.query('SELECT curl_count FROM spartan_curls WHERE guild_id=$1 AND boss_type=$2 FOR UPDATE', [CONFIG.guildId, type]);
+    const before = Number(beforeResult.rows[0].curl_count);
+    const actual = direction > 0 ? requested : Math.min(requested, before);
+    const after = before + direction * actual;
+    await db.query('UPDATE spartan_curls SET curl_count=$3 WHERE guild_id=$1 AND boss_type=$2', [CONFIG.guildId, type, after]);
+    await db.query(`INSERT INTO spartan_manual_actions(guild_id,boss_type,action_type,amount,moderator_id) VALUES($1,$2,$3,$4,$5)`,
+      [CONFIG.guildId, type, direction > 0 ? 'curl_add' : 'curl_remove', actual, interaction.user.id]);
+    await db.query('COMMIT');
+    const description = `**Değişiklik:** ${direction > 0 ? '+' : '-'}${actual} kıvrık\n**Önceki:** ${before}\n**Güncel:** ${after}\n**Yetkili:** ${interaction.user}`;
+    await sendAudit(cfg, `${direction > 0 ? '➕' : '➖'} ${cfg.label} KIVRIK ${direction > 0 ? 'EKLENDİ' : 'SİLİNDİ'}`, description);
+    return interaction.editReply(`✅ ${cfg.label} güncel kıvrık: ${after}`);
+  } catch (error) {
+    await db.query('ROLLBACK').catch(() => {}); console.error('❌ Kıvrık değişikliği:', error);
+    return interaction.editReply('❌ Kıvrık değiştirilemedi.');
+  } finally { db.release(); }
+}
+
+async function handleResult(interaction) {
+  const type = interaction.options.getString('tur');
+  const user = interaction.options.getUser('uye');
+  const cfg = CONFIG.types[type];
+  const curlResult = await pool.query('SELECT curl_count FROM spartan_curls WHERE guild_id=$1 AND boss_type=$2', [CONFIG.guildId, type]);
+  const curls = Number(curlResult.rows[0]?.curl_count || 0);
+  if (user) {
+    const result = await pool.query('SELECT set_count FROM spartan_user_sets WHERE guild_id=$1 AND user_id=$2 AND boss_type=$3', [CONFIG.guildId, user.id, type]);
+    return interaction.reply({ embeds: [embed(`${cfg.emoji} ${cfg.label} KULLANICI SONUCU`, `${user}\n\n**Güncel set:** ${Number(result.rows[0]?.set_count || 0)}`, cfg.color)] });
+  }
+  const result = await pool.query('SELECT user_id,set_count FROM spartan_user_sets WHERE guild_id=$1 AND boss_type=$2 AND set_count > 0 ORDER BY set_count DESC,user_id ASC', [CONFIG.guildId, type]);
+  const logCount = await pool.query('SELECT COUNT(*)::int AS count FROM spartan_logs WHERE guild_id=$1 AND boss_type=$2 AND deleted_at IS NULL', [CONFIG.guildId, type]);
+  const list = result.rows.map((row, i) => `${i + 1}. <@${row.user_id}> — **${row.set_count} set**`).join('\n') || 'Henüz set kaydı yok.';
+  const chunks = splitText(`**Toplam aktif log:** ${logCount.rows[0].count}\n**Güncel toplam kıvrık:** ${curls}\n\n${list}`, 3900);
+  return interaction.reply({ embeds: chunks.map((chunk, i) => embed(`📊 ${cfg.label} GENEL SONUÇ${chunks.length > 1 ? ` (${i + 1}/${chunks.length})` : ''}`, chunk, cfg.color)) });
+}
+
+async function handleLogDelete(interaction) {
+  if (!isLogAuthorized(interaction)) return interaction.reply({ content: '❌ Bu komut yalnızca log yetkilisi tarafından kullanılabilir.', ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+  const id = interaction.options.getInteger('id');
+  const db = await pool.connect();
+  try {
+    await db.query('BEGIN');
+    const found = await db.query('SELECT * FROM spartan_logs WHERE id=$1 AND guild_id=$2 FOR UPDATE', [id, CONFIG.guildId]);
+    const row = found.rows[0];
+    if (!row) { await db.query('ROLLBACK'); return interaction.editReply('❌ Bu log bulunamadı.'); }
+    if (row.deleted_at) { await db.query('ROLLBACK'); return interaction.editReply('❌ Bu log daha önce silinmiş.'); }
+    for (const userId of row.member_ids) {
+      await db.query('UPDATE spartan_user_sets SET set_count=GREATEST(0,set_count-$4) WHERE guild_id=$1 AND user_id=$2 AND boss_type=$3', [CONFIG.guildId, userId, row.boss_type, row.set_amount]);
+    }
+    await db.query('UPDATE spartan_curls SET curl_count=GREATEST(0,curl_count-$3) WHERE guild_id=$1 AND boss_type=$2', [CONFIG.guildId, row.boss_type, row.curl_amount]);
+    await db.query('UPDATE spartan_logs SET deleted_at=NOW(),deleted_by=$2 WHERE id=$1', [id, interaction.user.id]);
+    await db.query('COMMIT');
+    const cfg = CONFIG.types[row.boss_type];
+    const curlNow = await pool.query('SELECT curl_count FROM spartan_curls WHERE guild_id=$1 AND boss_type=$2', [CONFIG.guildId, row.boss_type]);
+    await sendAudit(cfg, `🗑️ ${cfg.label} LOG GERİ ALINDI`, `**Log ID:** #${id}\n**Seti geri alınan kişi:** ${row.member_ids.length}\n**Geri alınan kıvrık:** ${row.curl_amount}\n**Güncel kıvrık:** ${Number(curlNow.rows[0]?.curl_count || 0)}\n**Yetkili:** ${interaction.user}`);
+    return interaction.editReply(`✅ #${id} numaralı ${cfg.label} logu geri alındı.`);
+  } catch (error) {
+    await db.query('ROLLBACK').catch(() => {}); console.error('❌ Log silme:', error);
+    return interaction.editReply('❌ Log geri alınamadı.');
+  } finally { db.release(); }
 }
 
 const COOKIE_FILE = '/tmp/spartan-youtube-cookies.txt';
@@ -275,7 +444,12 @@ client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand() || interaction.guildId !== CONFIG.guildId) return;
   try {
     if (interaction.commandName === 'log') return handleLog(interaction);
-    if (interaction.commandName === 'durum') return handleStatus(interaction);
+    if (interaction.commandName === 'set-ekle') return handleSetChange(interaction, 1);
+    if (interaction.commandName === 'set-sil') return handleSetChange(interaction, -1);
+    if (interaction.commandName === 'kivrik-ekle') return handleCurlChange(interaction, 1);
+    if (interaction.commandName === 'kivrik-sil') return handleCurlChange(interaction, -1);
+    if (interaction.commandName === 'sonuc') return handleResult(interaction);
+    if (interaction.commandName === 'log-sil') return handleLogDelete(interaction);
     if (interaction.commandName === 'çal') return handlePlay(interaction);
     const queue = player.nodes.get(interaction.guildId);
     if (interaction.commandName === 'geç') {
